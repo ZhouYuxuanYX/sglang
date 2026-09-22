@@ -3,14 +3,12 @@ import os
 import time
 from typing import List, Optional
 
-import msgspec
 import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import (
     get_default_distributed_backend,
-    get_pp_group,
     get_tp_group,
     get_world_group,
     init_distributed_environment,
@@ -24,12 +22,12 @@ from sglang.srt.distributed.gated_launch import maybe_wait_for_gated_launch
 from sglang.srt.distributed.parallel_state import (
     _tag_groups_for_flashinfer_allreduce_only,
 )
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.layers.layernorm_sp import initialize_layernorm_sp
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    get_device,
     get_disagg,
     get_exec,
     get_parallel,
@@ -60,29 +58,22 @@ _is_cpu_arm64 = is_host_cpu_arm64()
 _TP_ALL_TO_ALL_WARMUP_BYTES_PER_PEER = 4 << 20
 
 
-class TorchDistributedResult(msgspec.Struct, frozen=True, kw_only=True):
-    tp_group: object
-    pp_group: object
-    attention_tp_group: object
-    pre_model_load_memory: float
-
-
 def init_torch_distributed(
     *,
     server_args: ServerArgs,
     model_config: ModelConfig,
     device: str,
-    ps: ParallelState,
     dist_port: int,
     is_draft_worker: bool,
     local_omp_cpuid: Optional[List[int]],
 ):
     tic = time.perf_counter()
     logger.info("Init torch distributed begin.")
+    parallel = get_parallel()
 
     backend = _resolve_backend(device=device)
 
-    before_avail_memory = get_available_gpu_memory(device, ps.gpu_id)
+    before_avail_memory = get_available_gpu_memory(device, get_device().gpu_id)
     if not get_parallel().enable_p2p_check:
         monkey_patch_p2p_access_check()
 
@@ -92,8 +83,8 @@ def init_torch_distributed(
     if not is_draft_worker:
         if device == "cpu":
             _init_cpu_threads_env(
-                tp_size=ps.tp_size,
-                tp_rank=ps.tp_rank,
+                tp_size=parallel.tp_size,
+                tp_rank=parallel.tp_rank,
                 local_omp_cpuid=local_omp_cpuid,
                 dist_init_method=dist_init_method,
             )
@@ -105,25 +96,18 @@ def init_torch_distributed(
             dist_init_method=dist_init_method,
             server_args=server_args,
             model_config=model_config,
-            gpu_id=ps.gpu_id,
-            tp_rank=ps.tp_rank,
-            tp_size=ps.tp_size,
-            pp_rank=ps.pp_rank,
-            pp_size=ps.pp_size,
-            attn_dp_size=ps.attn_dp_size,
-            attn_cp_size=ps.attn_cp_size,
-            moe_ep_size=ps.moe_ep_size,
-            moe_dp_size=ps.moe_dp_size,
-            dcp_size=ps.attn_dcp_size,
+            gpu_id=get_device().gpu_id,
         )
 
         # Pre-warm NCCL/RCCL/HCCL to eliminate cold-start latency in first request
         # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
         if get_exec().comm.pre_warm_nccl and (
-            ps.tp_size > 1 or ps.pp_size > 1 or ps.moe_ep_size > 1
+            parallel.tp_size > 1 or parallel.pp_size > 1 or parallel.moe_ep_size > 1
         ):
             _prewarm_nccl(
-                tp_size=ps.tp_size, pp_size=ps.pp_size, moe_ep_size=ps.moe_ep_size
+                tp_size=parallel.tp_size,
+                pp_size=parallel.pp_size,
+                moe_ep_size=parallel.moe_ep_size,
             )
 
         # CUDA graph capture enables the PyNCCL communicator for TP LM-head
@@ -133,7 +117,7 @@ def init_torch_distributed(
         if (
             device == "cuda"
             and get_parallel().enable_tp_lm_head_all_to_all
-            and ps.tp_size > 1
+            and parallel.tp_size > 1
         ):
             _prewarm_tp_lm_head_all_to_all()
 
@@ -145,17 +129,13 @@ def init_torch_distributed(
     # including them in this WORLD reduction would deadlock on absent peers.
     pre_model_load_memory = get_available_gpu_memory(
         device,
-        ps.gpu_id,
+        get_device().gpu_id,
         distributed=get_world_group().world_size > 1 and not is_draft_worker,
         cpu_group=get_world_group().cpu_group,
     )
-    tp_group = get_tp_group()
-    pp_group = get_pp_group()
-    attention_tp_group = get_parallel().attn_tp_group
-
     # Check memory for tensor parallelism
-    local_gpu_memory = get_available_gpu_memory(device, ps.gpu_id)
-    if ps.tp_size > 1 and not is_draft_worker:
+    local_gpu_memory = get_available_gpu_memory(device, get_device().gpu_id)
+    if parallel.tp_size > 1 and not is_draft_worker:
         _check_tp_memory_balance(
             pre_model_load_memory=pre_model_load_memory,
             local_gpu_memory=local_gpu_memory,
@@ -165,12 +145,7 @@ def init_torch_distributed(
         f"Init torch distributed ends. elapsed={time.perf_counter() - tic:.2f} s, "
         f"mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
     )
-    return TorchDistributedResult(
-        tp_group=tp_group,
-        pp_group=pp_group,
-        attention_tp_group=attention_tp_group,
-        pre_model_load_memory=pre_model_load_memory,
-    )
+    return pre_model_load_memory
 
 
 def _resolve_backend(*, device: str) -> str:
@@ -255,19 +230,13 @@ def _init_parallel_groups(
     server_args: ServerArgs,
     model_config: ModelConfig,
     gpu_id: int,
-    tp_rank: int,
-    tp_size: int,
-    pp_rank: int,
-    pp_size: int,
-    attn_dp_size: int,
-    attn_cp_size: int,
-    moe_ep_size: int,
-    moe_dp_size: int,
-    dcp_size: int,
 ) -> None:
+    parallel = get_parallel()
+    tp_size, pp_size = parallel.tp_size, parallel.pp_size
+    tp_rank, pp_rank = parallel.tp_rank, parallel.pp_rank
     is_ep_joiner = get_exec().moe.is_ep_joiner
     is_scale_joiner = get_exec().moe.is_ep_scale_joiner
-    rank_offset = get_parallel().ep_join_rank_offset if is_scale_joiner else 0
+    rank_offset = parallel.ep_join_rank_offset if is_scale_joiner else 0
     world_size = (
         rank_offset + tp_size * pp_size if is_scale_joiner else tp_size * pp_size
     )
@@ -285,14 +254,6 @@ def _init_parallel_groups(
         max_world_size=get_parallel().max_ep_size,
     )
     initialize_model_parallel(
-        tensor_model_parallel_size=tp_size,
-        attention_data_parallel_size=attn_dp_size,
-        pipeline_model_parallel_size=pp_size,
-        expert_model_parallel_size=moe_ep_size,
-        attention_context_model_parallel_size=attn_cp_size,
-        moe_data_model_parallel_size=moe_dp_size,
-        decode_context_parallel_size=dcp_size,
-        shared_experts_tensor_parallel_size=get_parallel().shared_experts_tp_size,
         duplicate_tp_group=get_disagg().enable_pdmux,
         enable_symm_mem=get_exec().comm.enable_symm_mem,
         # Only WORLD is extended during scale-up. The joiner's model-parallel
